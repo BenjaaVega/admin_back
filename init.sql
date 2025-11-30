@@ -71,6 +71,16 @@ CREATE INDEX IF NOT EXISTS idx_pr_url ON purchase_requests(url);
 CREATE INDEX IF NOT EXISTS idx_pr_status ON purchase_requests(status);
 CREATE INDEX IF NOT EXISTS idx_pr_user ON purchase_requests(user_id);
 
+-- Descuentos configurados por el administrador (RF08)
+CREATE TABLE IF NOT EXISTS admin_discounts (
+    id SERIAL PRIMARY KEY,
+    property_url TEXT UNIQUE NOT NULL,
+    discount_percent NUMERIC CHECK (discount_percent >= 0 AND discount_percent <= 0.10),
+    active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Log de eventos (para RF06)
 CREATE TABLE IF NOT EXISTS event_log (
     id BIGSERIAL PRIMARY KEY,
