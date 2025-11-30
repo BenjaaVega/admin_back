@@ -1,0 +1,152 @@
+services:
+
+  db:
+    image: postgres:16
+    container_name: postgres_db
+    restart: always
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "${DB_PORT}:${DB_PORT}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      retries: 5
+
+  api_1:
+    image: public.ecr.aws/i9t5a7b1/g6_arquisis/api:latest
+    container_name: fastapi_app_1
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      CONTAINER_NAME: fastapi_app_1
+      HOST: 0.0.0.0
+      PORT: 8001
+      BROKER: ${BROKER}
+      MQTT_PORT: ${MQTT_PORT}
+      MQTT_USERNAME: ${MQTT_USERNAME}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      REQUESTS_TOPIC: ${REQUESTS_TOPIC}
+      VALIDATION_TOPIC: ${VALIDATION_TOPIC}
+      INFO_TOPIC: ${INFO_TOPIC}
+      GROUP_ID: ${GROUP_ID}
+      # Configuración de Email
+      EMAIL_ENABLED: ${EMAIL_ENABLED:-true}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      FROM_EMAIL: ${FROM_EMAIL:-}
+      FROM_NAME: ${FROM_NAME:-Sistema de Propiedades}
+      AUTH_SERVICE_URL: http://auth_service:9000
+      WORKERS_SERVICE_URL: http://workers_service:9100
+      SERVICE_ACCOUNT_ID: ${SERVICE_ACCOUNT_ID:-worker-client}
+      SERVICE_ACCOUNT_SECRET: ${SERVICE_ACCOUNT_SECRET:-change-me}
+      WORKER_SERVICE_URL: ${WORKER_SERVICE_URL}
+    depends_on:
+      - db
+      - auth_service
+      - workers_service
+    ports:
+      - "8001:8000"
+
+  api_2:
+    image: public.ecr.aws/i9t5a7b1/g6_arquisis/api:latest
+    container_name: fastapi_app_2
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      CONTAINER_NAME: fastapi_app_2
+      HOST: 0.0.0.0
+      PORT: 8002
+      BROKER: ${BROKER}
+      MQTT_PORT: ${MQTT_PORT}
+      MQTT_USERNAME: ${MQTT_USERNAME}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      REQUESTS_TOPIC: ${REQUESTS_TOPIC}
+      VALIDATION_TOPIC: ${VALIDATION_TOPIC}
+      INFO_TOPIC: ${INFO_TOPIC}
+      GROUP_ID: ${GROUP_ID}
+      # Configuración de Email
+      EMAIL_ENABLED: ${EMAIL_ENABLED:-true}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      FROM_EMAIL: ${FROM_EMAIL:-}
+      FROM_NAME: ${FROM_NAME:-Sistema de Propiedades}
+      AUTH_SERVICE_URL: http://auth_service:9000
+      WORKERS_SERVICE_URL: http://workers_service:9100
+      SERVICE_ACCOUNT_ID: ${SERVICE_ACCOUNT_ID:-worker-client}
+      SERVICE_ACCOUNT_SECRET: ${SERVICE_ACCOUNT_SECRET:-change-me}
+      WORKER_SERVICE_URL: ${WORKER_SERVICE_URL}
+    depends_on:
+      - db
+      - auth_service
+      - workers_service
+    ports:
+      - "8002:8000"
+
+  mqtt_listener:
+    image: public.ecr.aws/i9t5a7b1/g6_arquisis/mqtt_listener:latest
+    container_name: mqtt_listener
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      MQTT_BROKER: ${BROKER}
+      MQTT_PORT: ${MQTT_PORT}
+      MQTT_USERNAME: ${MQTT_USERNAME}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      MQTT_TOPIC: ${TOPIC}
+      # Configuración de Email
+      EMAIL_ENABLED: ${EMAIL_ENABLED:-true}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      FROM_EMAIL: ${FROM_EMAIL:-}
+      FROM_NAME: ${FROM_NAME:-Sistema de Propiedades}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  auth_service:
+    image: public.ecr.aws/i9t5a7b1/g6_arquisis/auth_service:latest
+    container_name: auth_service
+    environment:
+      AUTH_AUDIENCE: workers-service
+      AUTH_ACCESS_TTL: 7200
+      AUTH_REFRESH_TTL: 86400
+      SERVICE_ACCOUNT_ID: ${SERVICE_ACCOUNT_ID:-worker-client}
+      SERVICE_ACCOUNT_SECRET: ${SERVICE_ACCOUNT_SECRET:-change-me}
+    ports:
+      - "9000:9000"
+    command: uvicorn auth_service.main:app --host 0.0.0.0 --port 9000
+
+  workers_service:
+    image: public.ecr.aws/i9t5a7b1/g6_arquisis/workers_service:latest
+    container_name: workers_service
+    environment:
+      AUTH_SERVICE_URL: http://auth_service:9000
+      AUTH_AUDIENCE: workers-service
+    ports:
+      - "9100:9100"
+    depends_on:
+      - auth_service
+    command: uvicorn workers_service.main:app --host 0.0.0.0 --port 9100
+
+volumes:
+  pgdata:

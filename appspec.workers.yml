@@ -1,0 +1,32 @@
+version: 0.0
+os: linux
+files:
+  # Que archivos se copiaran en la instancia
+  # https://docs.aws.amazon.com/codedeploy/latest/userguide/tutorials-on-premises-instance-2-create-sample-revision.html
+  - source: ./docker-compose.production.yml
+    # Carpeta donde lo vamos a dejar
+    destination: /home/ubuntu/g6_arquisis_back
+    overwrite: true
+  - source: scripts
+    destination: /home/ubuntu/g6_arquisis_back/scripts
+    overwrite: true
+
+# Ciclo de vida del deployment
+# https://docs.aws.amazon.com/codedeploy/latest/userguide/reference-appspec-file-structure-hooks.html
+hooks:
+  ApplicationStop:
+    - location: ./scripts/application-stop.workers.sh
+      timeout: 10000
+      runas: ubuntu
+  AfterInstall:
+    - location: ./scripts/after-install.workers.sh
+      timeout: 3000
+      runas: ubuntu
+  ApplicationStart:
+    - location: ./scripts/application-start.workers.sh
+      timeout: 3000
+      runas: ubuntu
+  ValidateService:
+    - location: ./scripts/validate-service.workers.sh
+      timeout: 3000
+      runas: ubuntu

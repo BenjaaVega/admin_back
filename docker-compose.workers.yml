@@ -1,0 +1,156 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis_broker
+    restart: always
+    command: redis-server --maxmemory 100mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+
+  jobmaster:
+    build:
+      context: ./jobmaster          # usa tu Dockerfile y main.py locales
+    image: jobmaster-stack-jobmaster
+    container_name: jobmaster_service
+    restart: always
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: ${DB_HOST}           # IMPORTANTE: IP elástica pública del backend donde está Postgres
+      DB_PORT: ${DB_PORT:-5432}
+    ports:
+      - "8000:8000"                 # expone API del JobMaster
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  worker1:
+    build:
+      context: ./jobmaster/worker   # usa tu celery_app.py + tasks.py locales
+    image: jobmaster-stack-worker1
+    container_name: celery_worker_1
+    restart: always
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: ${DB_HOST}           # misma IP elástica del backend (Postgres)
+      DB_PORT: ${DB_PORT:-5432}
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["celery", "-A", "celery_app", "worker",
+              "--loglevel=info",
+              "--concurrency=1",
+              "--hostname=worker1@%h",
+              "--max-tasks-per-child=20",
+              "--pool=solo"]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M            # scikit-learn/pandas necesitan más que 256M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Descomenta si subes de tamaño la instancia (t3.small+)
+  # worker2:
+  #   build:
+  #     context: ./jobmaster/worker
+  #   image: jobmaster-stack-worker2
+  #   container_name: celery_worker_2
+  #   restart: always
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  #     DB_NAME: ${DB_NAME}
+  #     DB_USER: ${DB_USER}
+  #     DB_PASSWORD: ${DB_PASSWORD}
+  #     DB_HOST: ${DB_HOST}
+  #     DB_PORT: ${DB_PORT:-5432}
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   command: ["celery", "-A", "celery_app", "worker",
+  #             "--loglevel=info",
+  #             "--concurrency=1",
+  #             "--hostname=worker2@%h",
+  #             "--max-tasks-per-child=20",
+  #             "--pool=solo"]
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: "0.5"
+  #         memory: 512M
+  #       reservations:
+  #         cpus: "0.25"
+  #         memory: 256M
+
+  flower:
+    build:
+      context: ./jobmaster/worker   # usa mismo repo (trae celery_app)
+    image: jobmaster-stack-flower
+    container_name: flower_monitor
+    restart: always
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["celery", "-A", "celery_app", "flower", "--port=5555"]
+    ports:
+      - "5555:5555"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+
+volumes:
+  redis_data:

@@ -1,0 +1,9 @@
+celery
+redis
+python-dotenv
+psycopg2-binary
+# numpy, pandas y scikit-learn comentados - no necesarios para algoritmo simple del enunciado
+# numpy
+# pandas
+# scikit-learn
+flower

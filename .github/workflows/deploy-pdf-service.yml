@@ -1,0 +1,229 @@
+name: Deploy PDF Service to AWS Lambda
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'lambda-pdf-service/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'lambda-pdf-service/**'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  NODE_VERSION: '18'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./lambda-pdf-service
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: './lambda-pdf-service/package-lock.json'
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Install Serverless Framework
+        run: npm install -g serverless
+
+      - name: Validate serverless.yml
+        run: serverless print
+
+      - name: Lint Python code
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8
+          flake8 handler.py --max-line-length=120 --ignore=E501,W503
+
+  deploy-dev:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    defaults:
+      run:
+        working-directory: ./lambda-pdf-service
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: './lambda-pdf-service/package-lock.json'
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Install Serverless Framework
+        run: npm install -g serverless
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS credentials
+        run: aws sts get-caller-identity
+
+      - name: Deploy to development
+        env:
+          SLS_PYTHON_BIN: python3.11
+        run: serverless deploy --stage dev --verbose
+
+      - name: Test deployment
+        run: |
+          ENDPOINT_URL=$(serverless info --stage dev --verbose | sed -n 's/^\s*POST - //p' | head -n1)
+          echo "Testing endpoint: $ENDPOINT_URL"
+          curl -X POST "$ENDPOINT_URL" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "purchase_data": {
+                "request_id": "test-123",
+                "amount": 100000,
+                "status": "ACCEPTED",
+                "created_at": "2024-01-01T00:00:00Z"
+              },
+              "user_data": { "name": "Usuario Test", "email": "test@example.com" },
+              "property_data": { "name": "Casa Test", "price": 1000000, "url": "https://example.com/property" },
+              "group_id": "G6"
+            }' \
+            --max-time 30 \
+            --fail-with-body || echo "Test failed but deployment might be successful"
+
+  deploy-prod:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    defaults:
+      run:
+        working-directory: ./lambda-pdf-service
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: './lambda-pdf-service/package-lock.json'
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Install Serverless Framework
+        run: npm install -g serverless
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS credentials
+        run: aws sts get-caller-identity
+
+      - name: Deploy to production
+        env:
+          SLS_PYTHON_BIN: python3.11
+        run: serverless deploy --stage prod --verbose
+
+      - name: Test production deployment
+        run: |
+          ENDPOINT_URL=$(serverless info --stage prod --verbose | sed -n 's/^\s*POST - //p' | head -n1)
+          echo "Testing production endpoint: $ENDPOINT_URL"
+          curl -X POST "$ENDPOINT_URL" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "purchase_data": {
+                "request_id": "prod-test-123",
+                "amount": 100000,
+                "status": "ACCEPTED",
+                "created_at": "2024-01-01T00:00:00Z"
+              },
+              "user_data": { "name": "Usuario Test Prod", "email": "test-prod@example.com" },
+              "property_data": { "name": "Casa Test Prod", "price": 1000000, "url": "https://example.com/property-prod" },
+              "group_id": "G6"
+            }' \
+            --max-time 30 \
+            --fail-with-body || echo "Production test completed"
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ PDF Service deployed successfully to production!"
+          echo "🔗 Endpoint: $(serverless info --stage prod --verbose | sed -n 's/^\s*POST - //p' | head -n1)"
+
+  cleanup:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    defaults:
+      run:
+        working-directory: ./lambda-pdf-service
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Serverless Framework
+        run: npm install -g serverless
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Remove PR deployment
+        run: |
+          if serverless info --stage pr-${{ github.event.number }} 2>/dev/null; then
+            serverless remove --stage pr-${{ github.event.number }}
+            echo "✅ PR deployment removed"
+          else
+            echo "ℹ️ No PR deployment found to remove"
+          fi

@@ -1,0 +1,194 @@
+name: Build and Push to ECR
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'api/**'
+      - 'mqtt_listener/**'
+      - 'jobmaster/**'
+      - '.github/workflows/build-and-push.yml'
+      - 'docker-compose.production.yml'
+      - 'docker-compose.workers.yml'
+      - 'appspec.yml'
+      - 'appspec.workers.yml'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          - name: api
+            path: ./api
+            repository: g6_arquisis/api
+          - name: mqtt_listener
+            path: ./mqtt_listener
+            repository: g6_arquisis/mqtt_listener
+          - name: jobmaster
+            path: ./jobmaster
+            repository: g6_arquisis/jobmaster
+          - name: worker
+            path: ./jobmaster/worker
+            repository: g6_arquisis/worker
+          - name: flower
+            path: ./jobmaster/worker
+            repository: g6_arquisis/flower
+          - name: auth_service
+            path: ./auth_service
+            repository: g6_arquisis/auth_service
+          - name: workers_service
+            path: ./workers_service
+            repository: g6_arquisis/workers_service
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            api:
+              - 'api/**'
+            mqtt_listener:
+              - 'mqtt_listener/**'
+            jobmaster:
+              - 'jobmaster/**'
+            worker:
+              - 'jobmaster/worker/**'
+            flower:
+              - 'jobmaster/worker/**'
+            auth_service:
+              - 'auth_service/**'
+            workers_service:
+              - 'workers_service/**'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID0 }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY0 }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR Public
+        id: login-ecr-public
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+          mask-password: "true"
+
+      - name: Build, tag, and push ${{ matrix.name }} image to Amazon ECR Public
+        if: ${{ steps.changes.outputs[matrix.name] == 'true' }}
+        env:
+          REGISTRY: ${{ steps.login-ecr-public.outputs.registry }}
+          REGISTRY_ALIAS: i9t5a7b1
+          REPOSITORY: ${{ matrix.repository }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "Building and pushing ${{ matrix.name }}..."
+          docker build -t $REGISTRY/$REGISTRY_ALIAS/$REPOSITORY:$IMAGE_TAG ${{ matrix.path }}
+          docker tag $REGISTRY/$REGISTRY_ALIAS/$REPOSITORY:$IMAGE_TAG $REGISTRY/$REGISTRY_ALIAS/$REPOSITORY:latest
+          docker push $REGISTRY/$REGISTRY_ALIAS/$REPOSITORY:$IMAGE_TAG
+          docker push $REGISTRY/$REGISTRY_ALIAS/$REPOSITORY:latest
+
+  deploy-to-ec2:
+    runs-on: ubuntu-latest
+    if: ${{ success() }}
+    needs: [build-and-push]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID0 }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY0 }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr-public
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+          mask-password: "true"
+
+      - name: Zip artifact to deploy
+        run: |
+          zip -r deploy.zip appspec.yml docker-compose.production.yml \
+            ./scripts/application-stop.sh \
+            ./scripts/after-install.sh \
+            ./scripts/application-start.sh \
+            ./scripts/validate-service.sh
+
+      - name: Copy Zip to S3
+        run: |
+          aws s3 cp deploy.zip s3://g6arquisisbucket/deploy.zip
+
+      - name: Create CodeDeploy deployment
+        id: create-deployment-trigger
+        run: |
+          deploymentId=$(aws deploy create-deployment --application-name \
+          g6_arquisis-CDApp --deployment-group-name g6-CDeploymentgroup --region us-east-1 \
+          --s3-location bucket=g6arquisisbucket,key=deploy.zip,bundleType=zip \
+          --description "Automatic deployment from GitHubActions commit ${{ github.sha }}" | jq -r '.deploymentId')
+          echo "deploymentId=$deploymentId" >> $GITHUB_OUTPUT
+
+      - name: Wait for deployment to finish
+        run: |
+          aws deploy wait deployment-successful --deployment-id ${{ steps.create-deployment-trigger.outputs.deploymentId }} --region us-east-1
+
+  # deploy-workers-to-ec2:
+  #   runs-on: ubuntu-latest
+  #   if: ${{ success() }}
+  #   needs: [build-and-push]
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+
+  #     - name: Configure AWS credentials
+  #       uses: aws-actions/configure-aws-credentials@v4
+  #       with:
+  #         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID1 }}
+  #         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY1 }}
+  #         aws-region: us-east-1
+
+  #     - name: Login to Amazon ECR
+  #       id: login-ecr-public
+  #       uses: aws-actions/amazon-ecr-login@v2
+  #       with:
+  #         registry-type: public
+  #         mask-password: "true"
+
+  #     - name: Zip workers artifact to deploy
+  #       run: |
+  #         zip -r deploy-workers.zip appspec.workers.yml docker-compose.workers.yml \
+  #           ./scripts/application-stop.workers.sh \
+  #           ./scripts/after-install.workers.sh \
+  #           ./scripts/application-start.workers.sh \
+  #           ./scripts/validate-service.workers.sh
+
+  #     - name: Copy Workers Zip to S3
+  #       run: |
+  #         aws s3 cp deploy-workers.zip s3://g6arquisisbucket/deploy-workers.zip
+
+  #     - name: Create CodeDeploy deployment for Workers
+  #       id: create-deployment-workers-trigger
+  #       run: |
+  #         deploymentId=$(aws deploy create-deployment --application-name \
+  #         g6_arquisis-workers-CDApp --deployment-group-name g6-workers-CDeploymentgroup --region us-east-1 \
+  #         --s3-location bucket=g6workersbucket,key=deploy-workers.zip,bundleType=zip \
+  #         --description "Automatic deployment from GitHubActions commit ${{ github.sha }}" | jq -r '.deploymentId')
+  #         echo "deploymentId=$deploymentId" >> $GITHUB_OUTPUT
+
+  #     - name: Wait for workers deployment to finish
+  #       run: |
+  #         aws deploy wait deployment-successful --deployment-id ${{ steps.create-deployment-workers-trigger.outputs.deploymentId }} --region us-east-1

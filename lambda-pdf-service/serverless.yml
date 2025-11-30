@@ -1,0 +1,98 @@
+service: g6-arquisis-pdf-service
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: python3.11
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  timeout: 30
+  memorySize: 512
+  environment:
+    STAGE: ${self:provider.stage}
+    GROUP_ID: G6
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:GetObject
+          Resource:
+            - "arn:aws:s3:::g6-arquisis-receipts-${self:provider.stage}/*"
+        - Effect: Allow
+          Action:
+            - s3:ListBucket
+          Resource:
+            - "arn:aws:s3:::g6-arquisis-receipts-${self:provider.stage}"
+
+functions:
+  generateReceipt:
+    handler: handler.lambda_handler
+    description: Genera boletas PDF y las sube a S3
+    events:
+      - http:
+          path: /generate-receipt
+          method: post
+          cors: true
+    environment:
+      S3_BUCKET: g6-arquisis-receipts-${self:provider.stage}
+
+resources:
+  Resources:
+    ReceiptsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: g6-arquisis-receipts-${self:provider.stage}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: false
+          BlockPublicPolicy: false
+          IgnorePublicAcls: false
+          RestrictPublicBuckets: false
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders: ["*"]
+              AllowedMethods: [GET, HEAD]
+              AllowedOrigins: ["*"]
+              MaxAge: 3000
+
+    ReceiptsBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: !Ref ReceiptsBucket
+        PolicyDocument:
+          Statement:
+            - Sid: PublicReadGetObject
+              Effect: Allow
+              Principal: "*"
+              Action: s3:GetObject
+              Resource: !Join
+                - ""
+                - - "arn:aws:s3:::"
+                  - !Ref ReceiptsBucket
+                  - "/*"
+
+  Outputs:
+    ReceiptsBucketName:
+      Description: "Nombre del bucket S3 para boletas"
+      Value: !Ref ReceiptsBucket
+      Export:
+        Name: ${self:service}-${self:provider.stage}-receipts-bucket
+
+    ApiGatewayRestApiId:
+      Description: "ID del API Gateway"
+      Value: !Ref ApiGatewayRestApi
+      Export:
+        Name: ${self:service}-${self:provider.stage}-api-id
+
+plugins:
+  - serverless-python-requirements
+
+custom:
+  pythonRequirements:
+    # Forzamos el binario y evitamos incluir boto3/botocore
+    pythonBin: python3.11
+    dockerizePip: false
+    noDeploy:
+      - boto3
+      - botocore

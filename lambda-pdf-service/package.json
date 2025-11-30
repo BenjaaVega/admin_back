@@ -1,0 +1,26 @@
+{
+  "name": "g6-arquisis-pdf-service",
+  "version": "1.0.0",
+  "description": "Servicio Lambda para generación de boletas PDF",
+  "main": "handler.py",
+  "scripts": {
+    "deploy": "serverless deploy",
+    "deploy:prod": "serverless deploy --stage prod",
+    "remove": "serverless remove",
+    "logs": "serverless logs -f generateReceipt",
+    "invoke": "serverless invoke -f generateReceipt"
+  },
+  "devDependencies": {
+    "serverless": "^3.38.0",
+    "serverless-python-requirements": "^6.0.0"
+  },
+  "keywords": [
+    "aws",
+    "lambda",
+    "pdf",
+    "serverless",
+    "g6"
+  ],
+  "author": "G6 Arquisis",
+  "license": "MIT"
+}
