@@ -6,7 +6,17 @@ except ImportError:
     canvas = None
 
 import os
-from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    Response,
+    Request,
+    Depends,
+    BackgroundTasks,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 import psycopg2
@@ -240,6 +250,58 @@ def verify_admin(user: dict = Depends(verify_jwt)) -> dict:
     return user
 
 
+def get_active_admin_discount(property_url: str) -> Optional[float]:
+    """Obtener descuento activo (<=10%) para una propiedad específica."""
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT discount_percent
+            FROM admin_discounts
+            WHERE property_url = %s AND active = TRUE
+            LIMIT 1
+            """,
+            (property_url,),
+        )
+        row = cur.fetchone()
+        if row and row.get("discount_percent") is not None:
+            return float(row["discount_percent"])
+        return None
+    finally:
+        cur.close()
+        conn.close()
+
+
+def upsert_admin_discount(property_url: str, discount_percent: float, active: bool) -> float:
+    """Crear o actualizar descuento de administrador para una propiedad."""
+
+    if discount_percent < 0 or discount_percent > 0.10:
+        raise HTTPException(status_code=400, detail="El descuento debe estar entre 0% y 10%")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO admin_discounts (property_url, discount_percent, active, updated_at)
+            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (property_url)
+            DO UPDATE SET discount_percent = EXCLUDED.discount_percent, active = EXCLUDED.active, updated_at = CURRENT_TIMESTAMP
+            """,
+            (property_url, discount_percent, active),
+        )
+        conn.commit()
+        return discount_percent
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"No se pudo actualizar el descuento: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+
 # ===== Helper para encolar recomendaciones en JobMaster =====
 def enqueue_recommendations(
     user_id: str,
@@ -309,6 +371,53 @@ async def options_handler(path: str):
             "Access-Control-Allow-Credentials": "true",
         }
     )
+
+
+class ConnectionManager:
+    """Gestor de conexiones WebSocket para actualizaciones en tiempo real (RF07)."""
+
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        stale_connections = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception:
+                stale_connections.append(connection)
+
+        for connection in stale_connections:
+            self.disconnect(connection)
+
+
+manager = ConnectionManager()
+
+
+def enqueue_purchase_event(background_tasks: BackgroundTasks, event: str, payload: dict):
+    """Encolar un evento para transmitirlo por WebSocket sin bloquear la petición."""
+
+    if background_tasks is not None:
+        background_tasks.add_task(manager.broadcast, {"event": event, **payload})
+
+
+@app.websocket("/ws/purchases")
+async def purchases_websocket(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        await websocket.send_json({"event": "connected", "message": "Escuchando compras en tiempo real"})
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 
 # Modelos Pydantic
@@ -448,6 +557,17 @@ class AuctionProposalDecisionResponse(BaseModel):
     success: bool
     message: str
 
+
+class AdminDiscountRequest(BaseModel):
+    url: str
+    discount_percent: float = 0.0
+
+
+class AdminDiscountResponse(BaseModel):
+    success: bool
+    url: str
+    discount_percent: float
+
 @app.get("/properties")
 def list_properties(
     response: Response,
@@ -474,21 +594,42 @@ def list_properties(
             p.url,
             p.is_project,
             p.visit_slots,
+            GREATEST(
+                p.visit_slots
+                - COALESCE((
+                    SELECT COUNT(*)
+                    FROM purchase_requests pr
+                    WHERE pr.url = p.url
+                    AND pr.status = 'ACCEPTED'
+                    AND (pr.group_id IS NULL OR pr.group_id <> %s)
+                ), 0)
+                - COALESCE((
+                    SELECT COUNT(*)
+                    FROM purchase_requests pr2
+                    WHERE pr2.url = p.url
+                    AND pr2.status = 'ACCEPTED'
+                    AND pr2.is_admin_reservation = TRUE
+                    AND pr2.purchased_by_user_id IS NULL
+                ), 0),
+                0
+            ) AS available_slots,
             p.timestamp AS last_updated,
-            CASE 
+            CASE
                 WHEN EXISTS (
-                    SELECT 1 FROM purchase_requests pr 
+                    SELECT 1 FROM purchase_requests pr
                     WHERE pr.url = p.url 
                     AND pr.is_admin_reservation = TRUE 
                     AND pr.status = 'ACCEPTED'
                     AND pr.purchased_by_user_id IS NULL
-                ) THEN TRUE 
-                ELSE FALSE 
-            END AS is_special_selection
+                ) THEN TRUE
+                ELSE FALSE
+            END AS is_special_selection,
+            ad.discount_percent AS admin_discount_percent
         FROM properties p
+        LEFT JOIN admin_discounts ad ON ad.property_url = p.url AND ad.active = TRUE
         WHERE 1=1
     """
-    params = []
+    params = [GROUP_ID]
 
     if price is not None:
         query += " AND p.price <= %s"
@@ -524,7 +665,35 @@ def get_property(property_id: int, response: Response, user: dict = Depends(veri
 
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM properties WHERE id=%s", (property_id,))
+    cur.execute(
+        """
+        SELECT p.*, 
+               GREATEST(
+                   p.visit_slots
+                   - COALESCE((
+                       SELECT COUNT(*)
+                       FROM purchase_requests pr
+                       WHERE pr.url = p.url
+                       AND pr.status = 'ACCEPTED'
+                       AND (pr.group_id IS NULL OR pr.group_id <> %s)
+                   ), 0)
+                   - COALESCE((
+                       SELECT COUNT(*)
+                       FROM purchase_requests pr2
+                       WHERE pr2.url = p.url
+                       AND pr2.status = 'ACCEPTED'
+                       AND pr2.is_admin_reservation = TRUE
+                       AND pr2.purchased_by_user_id IS NULL
+                   ), 0),
+                   0
+               ) AS available_slots,
+               ad.discount_percent AS admin_discount_percent
+        FROM properties p
+        LEFT JOIN admin_discounts ad ON ad.property_url = p.url AND ad.active = TRUE
+        WHERE p.id=%s
+        """,
+        (GROUP_ID, property_id),
+    )
     result = cur.fetchone()
     cur.close()
     conn.close()
@@ -832,7 +1001,11 @@ def jobs_test(user: dict = Depends(verify_jwt)):
     return result
 
 @app.post("/visits/request", response_model=VisitRequestOut)
-def create_visit_request(data: VisitRequestIn, user: dict = Depends(verify_jwt)):
+def create_visit_request(
+    data: VisitRequestIn,
+    user: dict = Depends(verify_jwt),
+    background_tasks: BackgroundTasks = None,
+):
     """
     RF05: Publica una solicitud de compra en properties/requests y registra en BD como PENDING.
     NO descuenta saldo aún; el descuento ocurre solo si llega VALIDATION con ACCEPTED.
@@ -960,7 +1133,14 @@ def create_visit_request(data: VisitRequestIn, user: dict = Depends(verify_jwt))
                 cur2.close(); conn2.close()
     except Exception as e:
         print(f"Failed to create recommendation job: {str(e)}")
-    
+
+    enqueue_purchase_event(background_tasks, "purchase_requested", {
+        "request_id": str(request_id),
+        "status": "PENDING",
+        "url": data.url,
+        "group_id": effective_group_id,
+    })
+
     return VisitRequestOut(
         request_id=str(request_id),
         status="PENDING",
@@ -1258,8 +1438,9 @@ def my_properties(user: dict = Depends(verify_jwt)):
 
 @app.post("/webpay/create", response_model=WebPayCreateResponse)
 def create_webpay_transaction(
-    request: WebPayCreateRequest, 
-    user: dict = Depends(verify_jwt)
+    request: WebPayCreateRequest,
+    user: dict = Depends(verify_jwt),
+    background_tasks: BackgroundTasks = None,
 ):
     """Crear transacción de WebPay para validar reserva de visita"""
     user_id = user.get("sub")
@@ -1326,7 +1507,8 @@ def create_webpay_transaction(
 @app.post("/webpay/commit", response_model=WebPayCommitResponse)
 def commit_webpay_transaction(
     request: WebPayCommitRequest,
-    user: dict = Depends(verify_jwt)
+    user: dict = Depends(verify_jwt),
+    background_tasks: BackgroundTasks = None,
 ):
     """Confirmar transacción de WebPay para reserva de visita"""
     user_id = user.get("sub")
@@ -1489,6 +1671,14 @@ def commit_webpay_transaction(
                 )
             except Exception as e:
                 print(f"[WARN] enqueue_recommendations (webpay/commit) failed: {e}")
+
+            enqueue_purchase_event(background_tasks, "purchase_requested", {
+                "request_id": str(request_id),
+                "status": "PENDING",
+                "url": property_url,
+                "group_id": effective_group_id,
+                "webpay": True,
+            })
 
             return WebPayCommitResponse(
                 success=True,
@@ -1678,6 +1868,22 @@ def get_admin_selections(admin: dict = Depends(verify_admin)):
     finally:
         cur.close()
         conn.close()
+
+
+@app.post("/admin/discounts/activate", response_model=AdminDiscountResponse)
+def activate_admin_discount(request: AdminDiscountRequest, admin: dict = Depends(verify_admin)):
+    """RF08: Permitir que un administrador active un descuento de hasta 10% para sus agendamientos."""
+
+    discount = upsert_admin_discount(request.url, request.discount_percent, True)
+    return AdminDiscountResponse(success=True, url=request.url, discount_percent=discount)
+
+
+@app.post("/admin/discounts/deactivate", response_model=AdminDiscountResponse)
+def deactivate_admin_discount(request: AdminDiscountRequest, admin: dict = Depends(verify_admin)):
+    """Desactivar el descuento asociado a un agendamiento del grupo administrador."""
+
+    discount = upsert_admin_discount(request.url, request.discount_percent, False)
+    return AdminDiscountResponse(success=True, url=request.url, discount_percent=discount)
 
 @app.post("/admin/auctions/offer", response_model=AuctionOfferResponse)
 def create_auction_offer(request: AuctionOfferRequest, admin: dict = Depends(verify_admin)):
@@ -2190,7 +2396,11 @@ def reject_auction_proposal(proposal_id: str, admin: dict = Depends(verify_admin
         conn.close()
 
 @app.post("/visits/purchase-admin-reservation")
-def purchase_admin_reservation(data: VisitRequestIn, user: dict = Depends(verify_jwt)):
+def purchase_admin_reservation(
+    data: VisitRequestIn,
+    user: dict = Depends(verify_jwt),
+    background_tasks: BackgroundTasks = None,
+):
     """
     Permite a usuarios normales comprar una reserva del administrador con 10% de descuento.
     """
@@ -2227,10 +2437,10 @@ def purchase_admin_reservation(data: VisitRequestIn, user: dict = Depends(verify
         if not admin_reservation:
             raise HTTPException(status_code=404, detail="No hay reservas del administrador disponibles para esta propiedad")
         
-        # Calcular precio con 10% de descuento (el 10% del precio original ya está pagado por el admin)
-        # El usuario paga el 10% del precio original (mismo que una reserva normal)
+        # Calcular precio base y aplicar descuento configurado por el administrador (RF08)
         price = float(admin_reservation["price"]) if admin_reservation.get("price") else 0.0
-        amount = price * 0.10
+        discount_percent = get_active_admin_discount(data.url) or 0.0
+        amount = price * 0.10 * (1 - discount_percent)
         
         # Verificar saldo del usuario
         cur.execute("SELECT balance FROM wallets WHERE user_id = %s", (user_id,))
@@ -2249,8 +2459,8 @@ def purchase_admin_reservation(data: VisitRequestIn, user: dict = Depends(verify
         
         # Marcar la reserva como comprada por el usuario
         cur.execute("""
-            UPDATE purchase_requests 
-            SET purchased_by_user_id = %s, updated_at = CURRENT_TIMESTAMP 
+            UPDATE purchase_requests
+            SET purchased_by_user_id = %s, updated_at = CURRENT_TIMESTAMP
             WHERE request_id = %s
         """, (user_id, admin_reservation["request_id"]))
         
@@ -2262,7 +2472,14 @@ def purchase_admin_reservation(data: VisitRequestIn, user: dict = Depends(verify
         """, (tx_id, user_id, amount, f"Compra de reserva del administrador (10% descuento): {data.url}", data.url))
         
         conn.commit()
-        
+
+        enqueue_purchase_event(background_tasks, "admin_reservation_purchased", {
+            "request_id": str(admin_reservation["request_id"]),
+            "url": data.url,
+            "purchased_by": user_id,
+            "discount_applied": discount_percent,
+        })
+
         return {
             "success": True,
             "request_id": str(admin_reservation["request_id"]),
